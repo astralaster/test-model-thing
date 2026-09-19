@@ -169,15 +169,23 @@ class Model(nn.Module):
     def load(self, path: str):
         if not os.path.exists(path): return
 
-        data, model, opts = mx.load(path), {}, {}
-        
+        data = mx.load(path)
+        model, opts = {}, {}
+
+        params = set(dict(util.tree_flatten(self.parameters())).keys())
+
         for k, v in data.items():
-            if k.startswith("m."): model[k[2:]] = v
-            elif k.startswith("o."): opts[k[2:]] = v
+            if k.startswith("m."):
+                key = k[2:]
+                if key in params: model[key] = v
+            elif k.startswith("o."):
+                key = k[2:]
+                base = key[:-2] if key.endswith((".m", ".v")) else key
+                if base in params or base in ("step", "learning_rate"): opts[key] = v
             elif k.startswith("state."): self.layers[int(k.split('.')[1])].states = v
             elif k.startswith("decaytrace."): self.layers[int(k.split('.')[1])].decaytrace = v
             elif k.startswith("embedtrace."): self.layers[int(k.split('.')[1])].embedtrace = v
-            
+
         if model: self.update(util.tree_unflatten(list(model.items())))
         if opts: self.optimizer.state = util.tree_unflatten(list(opts.items()))
 
