@@ -41,6 +41,8 @@ class Layer(nn.Module):
         self.weights = nn.Linear(dim, dim, bias = False)
         self.silu = nn.SiLU()
 
+        self.freeze(keys = ["states", "decaytrace", "embedtrace"], recurse = False)
+
     def __call__(self, enc: mx.array, x: mx.array, dummy: mx.array):
         decay = mx.sigmoid(self.decay)
         state = (decay * self.states) + enc + dummy
@@ -59,6 +61,15 @@ class Model(nn.Module):
 
         self.layers = [Layer(dim) for _ in range(layers)]
         self.optimizer = opt.AdamW(learning_rate = lr)
+        self.optimizer.init(self.trainable_parameters())
+
+        self.opt_step = mx.compile(self._apply_gradients)
+
+    def _apply_gradients(self, grads, params, state):
+        self.optimizer._state = state
+
+        params = self.optimizer.apply_gradients(grads, params)
+        return params, self.optimizer._state
 
     def sample(self, output: mx.array):
         probs = mx.softmax(output)
@@ -144,11 +155,12 @@ class Model(nn.Module):
 
             layer.decaytrace = mx.stop_gradient(decaytrace)
             layer.embedtrace = mx.stop_gradient(embedtrace)
-            
-            mx.eval(layer.states, layer.decaytrace, layer.embedtrace)
 
-        self.optimizer.update(self, grads)
-        mx.eval(self.parameters(), self.optimizer.state)
+        params, state = self.opt_step(grads, p, self.optimizer._state)
+
+        self.optimizer._state = state
+        self.update(params)
+        mx.eval(self.parameters())
 
         return self.sample(output).item(), stop.item()
 
@@ -173,6 +185,7 @@ class Model(nn.Module):
         model, opts = {}, {}
 
         params = set(dict(util.tree_flatten(self.parameters())).keys())
+        trainable = set(dict(util.tree_flatten(self.trainable_parameters())).keys())
 
         for k, v in data.items():
             if k.startswith("m."):
@@ -181,13 +194,17 @@ class Model(nn.Module):
             elif k.startswith("o."):
                 key = k[2:]
                 base = key[:-2] if key.endswith((".m", ".v")) else key
-                if base in params or base in ("step", "learning_rate"): opts[key] = v
+                if base in trainable or base in ("step", "learning_rate"): opts[key] = v
             elif k.startswith("state."): self.layers[int(k.split('.')[1])].states = v
             elif k.startswith("decaytrace."): self.layers[int(k.split('.')[1])].decaytrace = v
             elif k.startswith("embedtrace."): self.layers[int(k.split('.')[1])].embedtrace = v
 
         if model: self.update(util.tree_unflatten(list(model.items())))
-        if opts: self.optimizer.state = util.tree_unflatten(list(opts.items()))
+
+        if opts:
+            self.optimizer.state = util.tree_unflatten(list(opts.items()))
+
+        self.optimizer.init(self.trainable_parameters())
 
     def count(self) -> int:
         per_layer = self.dim * self.dim + 3 * self.dim
