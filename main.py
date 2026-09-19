@@ -1,8 +1,10 @@
 import argparse
 import glob
 import itertools
+import multiprocessing
 import os
 import random
+import signal
 import sys
 import time
 from datetime import datetime
@@ -50,11 +52,16 @@ class Layer(nn.Module):
         return x + self.silu(self.weights(self.norm(state))), state, decay
 
 class Model(nn.Module):
-    def __init__(self, dim: int, layers: int, temp: float, lr: float):
+    def __init__(self, dim: int, layers: int, temp: float, lr: float, accum: int = 1):
         super().__init__()
         self.dim = dim
         self.layercount = layers
         self.temp = temp
+        self.accum_k = max(1, int(accum))
+
+        object.__setattr__(self, "accum", None)
+        self.accum_n = 0
+        self.opt_steps = 0
 
         self.encoder = Encoder(dim)
         self.decoder = Decoder(dim)
@@ -70,6 +77,28 @@ class Model(nn.Module):
 
         params = self.optimizer.apply_gradients(grads, params)
         return params, self.optimizer._state
+
+    def _accumulate(self, grads, params):
+        if self.accum_k == 1:
+            self.opt_steps += 1
+            return self.opt_step(grads, params, self.optimizer._state)
+
+        scale = 1.0 / self.accum_k
+
+        if self.accum is None: object.__setattr__(self, "accum", util.tree_map(lambda g: g * scale, grads))
+        else: object.__setattr__(self, "accum", util.tree_map(lambda a, g: a + g * scale, self.accum, grads))
+
+        mx.eval(self.accum)
+        self.accum_n += 1
+
+        if self.accum_n < self.accum_k: return params, self.optimizer._state
+
+        grads = self.accum
+        object.__setattr__(self, "accum", None)
+        self.accum_n = 0
+        self.opt_steps += 1
+
+        return self.opt_step(grads, params, self.optimizer._state)
 
     def sample(self, output: mx.array):
         probs = mx.softmax(output)
@@ -156,7 +185,7 @@ class Model(nn.Module):
             layer.decaytrace = mx.stop_gradient(decaytrace)
             layer.embedtrace = mx.stop_gradient(embedtrace)
 
-        params, state = self.opt_step(grads, p, self.optimizer._state)
+        params, state = self._accumulate(grads, p)
 
         self.optimizer._state = state
         self.update(params)
@@ -174,7 +203,13 @@ class Model(nn.Module):
             data[f"decaytrace.{i}"] = layer.decaytrace
             data[f"embedtrace.{i}"] = layer.embedtrace
 
-        tmp = 'temporary-' + path
+        if self.accum is not None:
+            for k, v in util.tree_flatten(self.accum): data[f"g.{k}"] = v
+
+        data["acc.n"] = mx.array([self.accum_n], dtype = mx.int32)
+        data["acc.steps"] = mx.array([self.opt_steps], dtype = mx.int32)
+
+        tmp = os.path.join(os.path.dirname(path), 'temporary-' + os.path.basename(path))
         mx.save_safetensors(tmp, data)
         os.replace(tmp, path)
 
@@ -183,6 +218,7 @@ class Model(nn.Module):
 
         data = mx.load(path)
         model, opts = {}, {}
+        accum = {}
 
         params = set(dict(util.tree_flatten(self.parameters())).keys())
         trainable = set(dict(util.tree_flatten(self.trainable_parameters())).keys())
@@ -198,8 +234,13 @@ class Model(nn.Module):
             elif k.startswith("state."): self.layers[int(k.split('.')[1])].states = v
             elif k.startswith("decaytrace."): self.layers[int(k.split('.')[1])].decaytrace = v
             elif k.startswith("embedtrace."): self.layers[int(k.split('.')[1])].embedtrace = v
+            elif k.startswith("g."): accum[k[2:]] = v
+            elif k == "acc.n": self.accum_n = int(v.item())
+            elif k == "acc.steps": self.opt_steps = int(v.item())
 
         if model: self.update(util.tree_unflatten(list(model.items())))
+
+        if accum: object.__setattr__(self, "accum", util.tree_unflatten(list(accum.items())))
 
         if opts:
             self.optimizer.state = util.tree_unflatten(list(opts.items()))
@@ -211,25 +252,35 @@ class Model(nn.Module):
         return 256 * self.dim + self.layercount * per_layer + 256 * self.dim + 256 + self.dim + 1
 
 class Runtime:
-    def __init__(self, path: str, threshold: float, **kwargs):
-        self.model = Model(**kwargs)
+    def __init__(self, path: str, threshold: float, accum: int = 1, sync_every: int = 0, rank: int = 0, workers: int = 1, distributed = None, **kwargs):
+        self.model = Model(accum = accum, **kwargs)
         self.path = path
         self.threshold = threshold
+        self.sync_every = sync_every
+        self.rank = rank
+        self.workers = workers
+        self.dist = distributed
 
         self.step = 0
         self.prevtime = None
 
     def save(self):
         self.step += 1
-        if self.step % 500 == 0: self.model.save(self.path)
+        if self.step % 500 == 0 and (self.dist is None or self.rank == 0): self.model.save(self.path)
 
     def call(self, c: int, n: int | None, end: bool, save: bool, frozen: bool):
+        before = self.model.opt_steps
         outputs = self.model(c, n, end, frozen)
+
+        if self.dist is not None and self.sync_every and self.model.opt_steps != before and self.model.opt_steps % self.sync_every == 0:
+            self.dist.sync(self.model)
 
         if save: self.save()
         return outputs
 
     def write(self, b: int):
+        if self.rank: return
+
         sys.stdout.buffer.write(bytes([b]))
         sys.stdout.flush()
 
@@ -254,26 +305,58 @@ class Runtime:
                     print()
                     break
 
-    def train(self, save: bool, frozen: bool, dataset: str):
-        files = glob.glob(dataset, recursive = True)
+    def train(self, save: bool, frozen: bool, dataset: str, start: int = 0, end: int | None = None):
+        files = sorted(glob.glob(dataset, recursive = True))
 
         if not files:
             raise FileNotFoundError(
                 f'Could not find training files with the following glob: {dataset!r}. Try downloading a dataset first.'
             )
 
-        random.shuffle(files)
+        if self.dist is not None: random.Random(0).shuffle(files)
+        else: random.shuffle(files)
+
+        sizes = [os.path.getsize(file) for file in files]
 
         while True:
-            for file in files:
-                with open(file, 'r', encoding = 'utf-8', errors = 'ignore') as f:
-                    for line in f:
-                        data = line.encode('utf-8')
+            base = 0
+            stop = False
+
+            for file, size in zip(files, sizes):
+                if stop: break
+
+                with open(file, 'rb') as f:
+                    pos = 0
+
+                    for data in f:
+                        gstart = base + pos
+                        pos += len(data)
+
+                        if end is not None and gstart >= end:
+                            stop = True
+                            break
+
+                        if gstart + len(data) <= start: continue
                         if len(data) < 2: continue
 
                         for i, (c, n) in enumerate(itertools.pairwise(data)):
                             b, _ = self.call(c, n, i == len(data) - 2, save, frozen)
                             self.write(b)
+
+                base += size
+
+    def distributed_run(self, dataset: str, save: bool, frozen: bool, start: int, end: int):
+        self.model.load(self.path)
+
+        self.dist.setup(self.model)
+        self.dist.broadcast(self.model)
+
+        print(f'[worker {self.rank}] parameters: {self.model.count():,}', flush=True)
+
+        try:
+            self.train(save, frozen, dataset, start, end)
+        finally:
+            if save and self.rank == 0: self.model.save(self.path)
 
     def now(self): return datetime.now().strftime('%d/%m/%Y, %H:%M:%S')
 
@@ -289,6 +372,120 @@ class Runtime:
         finally:
             if save: self.model.save(self.path)
 
+class Distributed:
+    def __init__(self, rank: int, workers: int, buffer, barrier):
+        self.rank = rank
+        self.workers = workers
+        self.buffer = buffer
+        self.barrier = barrier
+
+        self.view = memoryview(buffer)
+        self.bytes = self.view.cast('B')
+
+        self.metas = None
+        self.total = None
+
+    def setup(self, model: Model):
+        leaves = util.tree_flatten(model.trainable_parameters())
+
+        self.metas = [(k, v.shape, v.size) for k, v in leaves]
+        self.total = sum(size for _, _, size in self.metas)
+
+    def _flat(self, model: Model):
+        leaves = util.tree_flatten(model.trainable_parameters())
+
+        flat = mx.concatenate([v.reshape(-1) for _, v in leaves])
+        mx.eval(flat)
+
+        return flat
+
+    def _write(self, model: Model):
+        flat = self._flat(model)
+        offset = self.rank * self.total
+
+        self.bytes[offset * 4:(offset + self.total) * 4] = memoryview(flat).cast('B')
+
+    def _apply(self, model: Model, vec: mx.array):
+        params, index = {}, 0
+
+        for k, shape, size in self.metas:
+            params[k] = vec[index:index + size].reshape(shape)
+            index += size
+
+        model.update(util.tree_unflatten(list(params.items())))
+        mx.eval(model.parameters())
+
+    def broadcast(self, model: Model):
+        if self.rank == 0: self._write(model)
+
+        self.barrier.wait()
+        self._apply(model, mx.array(self.view).reshape(self.workers, self.total)[0])
+        self.barrier.wait()
+
+    def sync(self, model: Model):
+        self._write(model)
+
+        self.barrier.wait()
+        mean = mx.mean(mx.array(self.view).reshape(self.workers, self.total), axis = 0)
+        self._apply(model, mean)
+        self.barrier.wait()
+
+def worker_main(rank: int, config: dict, buffer, barrier, start: int, end: int):
+    distributed = Distributed(rank, config['workers'], buffer, barrier)
+
+    runtime = Runtime(
+        path = config['path'], threshold = 0.35, dim = config['dim'], layers = config['layers'],
+        temp = config['temp'], lr = config['lr'], accum = config['accum'],
+        sync_every = config['sync_every'], rank = rank, workers = config['workers'], distributed = distributed,
+    )
+
+    runtime.distributed_run(config['dataset'], config['save'], config['frozen'], start, end)
+
+def run_distributed(config: dict):
+    context = multiprocessing.get_context('spawn')
+    workers = config['workers']
+
+    template = Model(dim = config['dim'], layers = config['layers'], temp = config['temp'], lr = config['lr'], accum = config['accum'])
+    total = sum(v.size for _, v in util.tree_flatten(template.trainable_parameters()))
+
+    print(f'parameters: {template.count():,}')
+
+    files = sorted(glob.glob(config['dataset'], recursive = True))
+
+    if not files:
+        raise FileNotFoundError(
+            f'Could not find training files with the following glob: {config["dataset"]!r}. Try downloading a dataset first.'
+        )
+
+    random.Random(0).shuffle(files)
+    total_bytes = sum(os.path.getsize(file) for file in files)
+    span = total_bytes // workers
+
+    buffer = context.RawArray('f', total * workers)
+    barrier = context.Barrier(workers)
+
+    processes = []
+
+    for rank in range(workers):
+        start = rank * span
+        end = total_bytes if rank == workers - 1 else (rank + 1) * span
+
+        process = context.Process(target = worker_main, args = (rank, config, buffer, barrier, start, end))
+        process.daemon = True
+        processes.append(process)
+
+    def terminate(*_): raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+
+    for process in processes: process.start()
+    try:
+        for process in processes: process.join()
+    except KeyboardInterrupt:
+        for process in processes: process.terminate()
+        for process in processes: process.join()
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'test-model-thing')
     parser.add_argument('path')
@@ -298,9 +495,25 @@ if __name__ == '__main__':
     parser.add_argument('--no-save', action = 'store_false')
     parser.add_argument('--dataset', default = 'wikipedia_clean/**/wiki_*')
 
+    parser.add_argument('--workers', type = int, default = 1)
+    parser.add_argument('--accum', type = int, default = 8)
+    parser.add_argument('--sync-every', type = int, default = 200)
+
     args = parser.parse_args()
 
-    runtime = Runtime(path = args.path, threshold = 0.35, dim = 512, layers = 16, temp = 0.75, lr = 5e-4)
-    print(f'parameters: {runtime.model.count():,}')
+    if args.mode == 'train' and args.workers > 1:
+        config = {
+            'path': args.path, 'dataset': args.dataset, 'save': args.no_save, 'frozen': args.frozen,
+            'dim': 512, 'layers': 16, 'temp': 0.75, 'lr': 5e-4, 'workers': args.workers,
+            'accum': args.accum, 'sync_every': args.sync_every,
+        }
 
-    runtime(args.mode, args.dataset, args.no_save, args.frozen)
+        run_distributed(config)
+    else:
+        runtime = Runtime(
+            path = args.path, threshold = 0.35, dim = 512, layers = 16, temp = 0.75, lr = 5e-4,
+            accum = 1 if args.mode == 'chat' else args.accum, sync_every = args.sync_every,
+        )
+        print(f'parameters: {runtime.model.count():,}')
+
+        runtime(args.mode, args.dataset, args.no_save, args.frozen)
